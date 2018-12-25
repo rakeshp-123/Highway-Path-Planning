@@ -8,6 +8,9 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
+#include "vehicle.h"
+#include "planner.h"
 
 using namespace std;
 
@@ -199,8 +202,13 @@ int main() {
   	map_waypoints_dx.push_back(d_x);
   	map_waypoints_dy.push_back(d_y);
   }
+  
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  int lane_num = -1; // Initialize lane number with invalid data. It will read from car localization data given.
+  double ref_vel = 0.0; // starting velocity
+  bool first_time = true; //to start the car 1st time.
+  Vehicle myCar(-1); //Create car object as my vehicle.
+  h.onMessage([&first_time, &myCar, &ref_vel, &lane_num,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -208,7 +216,8 @@ int main() {
     //auto sdata = string(data).substr(0, length);
     //cout << sdata << endl;
     if (length && length > 2 && data[0] == '4' && data[1] == '2') {
-
+	  
+	
       auto s = hasData(data);
 
       if (s != "") {
@@ -226,7 +235,7 @@ int main() {
           	double car_d = j[1]["d"];
           	double car_yaw = j[1]["yaw"];
           	double car_speed = j[1]["speed"];
-
+			
           	// Previous path data given to the Planner
           	auto previous_path_x = j[1]["previous_path_x"];
           	auto previous_path_y = j[1]["previous_path_y"];
@@ -236,14 +245,198 @@ int main() {
 
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
           	auto sensor_fusion = j[1]["sensor_fusion"];
-
+			int prev_size = previous_path_x.size();
           	json msgJson;
-
+			
+	
+			if(prev_size > 0)
+			{
+				car_s = end_path_s;
+              	car_d = end_path_d;
+			}
+			myCar.setPosition(car_s, car_d);
+			myCar.setVelocity(car_speed);
+          
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
+          	vector<double> ptsx;
+          	vector<double> ptsy;
+          
+          	if(first_time)
+            {
+              	lane_num = static_cast<int>(myCar.laneID); //read lane data from car localization data
+              	first_time = false;
+              	if(ref_vel < 49.5)
+				{
+					ref_vel += .224; // start car.
+				}
+            }
+         	else
+            {
+				myCar.laneID = static_cast<lane>(lane_num); // read lane data from previous suggested lane switch by path planner
+                        	
+				vector<Vehicle> carList;
+				/************************ Prediction ********************************/
+				//Read sensor data to get all nearby car information for processing.
+			  	for(int i = 0; i <  sensor_fusion.size(); i++)
+			 	{
+				 	int id = sensor_fusion[i][0];
+				 	double vx = sensor_fusion[i][3];
+				 	double vy = sensor_fusion[i][4];
+					double s = sensor_fusion[i][5];
+					double d = sensor_fusion[i][6];
 
-
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+					Vehicle car(id);
+					car.setPosition(s, d);
+					car.setVelocity(sqrt(vx * vx + vy * vy));
+					carList.push_back(car);
+				}
+				/******************************* Behaviour planning********************/
+              	// Run  planner to get the next suggested lane change state that minimise cost defined
+				Planner planner;
+				Movement next_state = planner.planNextMovement(myCar, carList);
+				cout<<"next_state : "<<static_cast<int>(next_state)<<"\n";
+            	//cout<<"myCar.collision_chance : "<<myCar.collision_chance<<"\n";
+          		cout<<"current Lane ID : "<<lane_num<<"\n";
+				if(next_state == Movement::LANE_CHANGE_RIGHT)
+				{
+                  	// Do lane change if there is vehicle in front and chances of collision is high and also when not in middle lane.
+					if((myCar.collision_chance) || (lane_num == 0))
+                    {
+                      lane_num++;
+                    }
+				}
+				else if(next_state == Movement::LANE_CHANGE_LEFT)
+				{
+					// Do lane change if there is vehicle in front and chances of collision is high and also when not in middle lane.
+					if((myCar.collision_chance) || (lane_num == 2))
+                    {
+                      lane_num--;
+                    }
+				}
+				else
+				{
+					if(myCar.collision_chance)
+					{
+                      	//reduce speed to avoid collosion
+						ref_vel -= .224;
+						myCar.collision_chance = false;
+					}
+					else if(ref_vel < 49.5)
+					{
+                      	//No obstruction. increase speed until reaching maximum threshold
+						ref_vel += .224;
+					}
+				}
+				cout<<"new Lane ID : "<<lane_num<<"\n";
+        	}
+          
+            /*****************************Trajectory Generation**********************************************/
+			double ref_x = car_x;
+			double ref_y = car_y;
+			double ref_yaw = deg2rad(car_yaw);
+			std::cout << "prev_size : " << prev_size << std::endl;
+			if(prev_size < 2)
+			{
+				//very less previous data. Use 2 points that make the path or line tangent to car position.
+				double prev_x_cor = car_x - cos(car_yaw);
+				double prev_y_cor = car_y - sin(car_yaw);
+				
+				ptsx.push_back(prev_x_cor);
+				ptsx.push_back(car_x);
+				
+				ptsy.push_back(prev_y_cor);
+				ptsy.push_back(car_y);
+			}
+			
+			else
+			{
+				//Lot of point availaable.
+				// take previous point as ref and prevous - 1 point also to make line;
+				ref_x = previous_path_x[prev_size - 1];
+				ref_y = previous_path_y[prev_size - 1];
+				
+				double prevref_x = previous_path_x[prev_size - 2];
+				double prevref_y = previous_path_y[prev_size - 2];
+				
+				ref_yaw = atan2((ref_y - prevref_y), (ref_x - prevref_x));
+				
+				ptsx.push_back(prevref_x);
+				ptsx.push_back(ref_x);
+				
+				ptsy.push_back(prevref_y);
+				ptsy.push_back(ref_y);
+				
+			}
+			
+			vector<double> next_wp0 = getXY(car_s + 30, 2 + 4*lane_num, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+			vector<double> next_wp1 = getXY(car_s + 60, 2 + 4*lane_num, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+			vector<double> next_wp2 = getXY(car_s + 90, 2 + 4*lane_num, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+			
+			ptsx.push_back(next_wp0[0]);
+			ptsx.push_back(next_wp1[0]);
+			ptsx.push_back(next_wp2[0]);
+			
+			ptsy.push_back(next_wp0[1]);
+			ptsy.push_back(next_wp1[1]);
+			ptsy.push_back(next_wp2[1]);
+			
+			int i = 0;
+			for(i = 0; i <  ptsx.size(); i++)
+			{
+				// shift asix to match normal co-ordinate instead of car direction. It is done for generating plynomial trajectory to handle jerk.
+				double dx = ptsx[i] - ref_x;
+				double dy = ptsy[i] - ref_y;
+				
+				ptsx[i] = dx*cos(0-ref_yaw) - dy*sin(0-ref_yaw);
+				ptsy[i] = dx*sin(0-ref_yaw) + dy*cos(0-ref_yaw);
+			}
+			
+			
+			//spline use
+			
+			tk::spline s;
+			
+			s.set_points(ptsx, ptsy);
+			
+			//push previous remaining waypoints points generated in last iteration
+			for(i = 0; i <  prev_size; i++)
+			{
+				next_x_vals.push_back(previous_path_x[i]);
+				next_y_vals.push_back(previous_path_y[i]);
+			}
+			
+          	// Add new waypoints until it reaches 50.
+			double target_x = 30.0;
+			double target_y = s(target_x);
+			double target_dist = sqrt(target_x*target_x + target_y*target_y);
+			
+			double x_add_on = 0.0;
+			
+			for(i = 1; i< 50 - prev_size; i++)
+			{
+				double N  = target_dist/(0.02*ref_vel/2.24);
+				double x_point = x_add_on+target_x/N;
+				double y_point = s(x_point);
+				
+				x_add_on = x_point;
+				
+				double x_ref = x_point;
+				double y_ref = y_point;
+				
+              	// shift back co-ordinates to car axis before pushing to simulator for driving.
+				x_point = x_ref*cos(ref_yaw) - y_ref*sin(ref_yaw);
+				y_point = x_ref*sin(ref_yaw) + y_ref*cos(ref_yaw);
+				
+				x_point = x_point + ref_x;
+				y_point  = y_point + ref_y;
+				next_x_vals.push_back(x_point);
+				next_y_vals.push_back(y_point);
+			}
+			
+			
+          //std::cout << "Lane : " << lane_num << std::endl;
+          //std::cout << "next_y_vals.size() : " << next_y_vals.size() << std::endl;
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
